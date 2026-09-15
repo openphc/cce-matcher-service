@@ -53,8 +53,12 @@ public class FacilityService {
      * Single-pass extraction of facility ID and display name from the FHIR payload.
      * Both values sit on the same Reference node, so one walk covers both.
      *
-     * ID: CloudEvent envelope facilityid (preferred) → reference string (strip prefix) → identifier.value
-     * Name: display field on the same Reference node
+     * ID:   CloudEvent envelope facilityid (preferred) → reference string (strip prefix) → identifier.value
+     * Name: CloudEvent envelope facilityname (preferred) → display field on the same Reference node (fallback)
+     *
+     * When the envelope already carries both facilityid and facilityname, every path below resolves
+     * to those two values anyway (the payload is only ever consulted for whichever one is missing),
+     * so that case short-circuits up front without touching the FHIR body at all.
      *
      * Resource paths (mirrors FacilityIdExtractor in openhim-cce-emitter-adaptor):
      *   ServiceRequest : locationReference[0]
@@ -76,8 +80,18 @@ public class FacilityService {
      */
     private FacilityDetails extractFacilityDetails(CloudEventMessage event) {
         String facilityId = event.getFacilityid();
+        String facilityName = event.getFacilityname();
+
+        boolean hasEnvelopeFacilityId = facilityId != null && !facilityId.isBlank();
+        boolean hasEnvelopeFacilityName = facilityName != null && !facilityName.isBlank();
+        if (hasEnvelopeFacilityId && hasEnvelopeFacilityName) return new FacilityDetails(facilityId, facilityName);
+
+        // fromRefNode below always resolves the name from the matched node's own display field —
+        // it should describe whichever facility the id ends up resolving to, not an unrelated
+        // envelope value. If the envelope supplied a name without an id (hasEnvelopeFacilityId
+        // false, hasEnvelopeFacilityName true), that value is only used by the tail fallback further
+        // down, where no reference node exists to read a display from at all.
         JsonNode eventData = event.getData();
-        if (eventData == null && (facilityId == null || facilityId.isBlank())) return null;
 
         // ServiceRequest: locationReference[0]
         JsonNode locationRef = eventData != null ? eventData.get("locationReference") : null;
@@ -119,10 +133,12 @@ public class FacilityService {
         // because Observation/Condition/MedicationRequest/... carry no FHIR location field at all —
         // the extension is their only signal. An Encounter never reaches this point, having already
         // returned from hospitalization.origin or location[0] above; that is deliberate, because the
-        // extension cannot distinguish a TRANSFER_ENCOUNTER's origin from its destination. No display
-        // name is available at this point.
-        String resolvedId = facilityId != null && !facilityId.isBlank() ? facilityId : extractSourceFacilityExtension(eventData);
-        return resolvedId != null ? new FacilityDetails(resolvedId, null) : null;
+        // extension cannot distinguish a TRANSFER_ENCOUNTER's origin from its destination. There's no
+        // Reference node here to read a display field from, so the name — if any — can only come
+        // from the envelope facilityname.
+        String resolvedFacilityId = hasEnvelopeFacilityId ? facilityId : extractSourceFacilityExtension(eventData);
+        String resolvedFacilityName = hasEnvelopeFacilityName ? facilityName : null;
+        return resolvedFacilityId != null ? new FacilityDetails(resolvedFacilityId, resolvedFacilityName) : null;
     }
 
     /**
