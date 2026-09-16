@@ -141,14 +141,20 @@ public class StepInstanceService {
         SlaThresholdReader.SlaThresholds thresholds = slaThresholdReader.getThresholds(step.getId());
 
         // sla_status is deliberately left alone. Recording that the work happened and judging whether
-        // it was timely are different questions with different owners; writing both here is what used
-        // to require a rule about which service may overwrite the other.
+        // it was timely are different questions with different owners; this service only schedules the
+        // second one (below), and writing both here is what used to require a rule about which service
+        // may overwrite the other.
         step.setStepStatus(StepStatus.COMPLETED);
         step.setCompletedAt(completedAt);
         step.setMatchedEventId(matchedEventId);
         step.setCompletedBySource(completedBySource);
 
         stepInstanceRepository.save(step);
+
+        // Work recorded before the deadline is a verdict waiting to be written, so schedule it now.
+        // The Step SLA Service takes the row on its next cycle; without it, a step completed weeks
+        // early would sit unjudged until its due date arrived.
+        slaScheduleService.scheduleMetIfOnTime(step, completedAt);
 
         // Capture the COMPLETED transition in append-only history.
         stateTransitionHistoryWriter.recordStepInstanceTransition(step, now);
@@ -198,8 +204,8 @@ public class StepInstanceService {
 
     /**
      * Whether a step is still genuinely outstanding: its event has not arrived and its SLA can
-     * still move. Excludes SLAs already settled — MISSED (written off) and MET (an optional step
-     * closed out).
+     * still move. Excludes SLAs already settled — {@code MISSED}, written off, and {@code MET},
+     * recorded on time. {@code OVERDUE} is not settled: a late event can still complete such a step.
      */
     private boolean isOutstandingStep(StepInstance step) {
         return step.getStepStatus() == StepStatus.NOT_STARTED && isLiveSlaStatus(step.getSlaStatus());
@@ -208,7 +214,7 @@ public class StepInstanceService {
     /**
      * Detect order violations: when a step completes, check whether any of its mandatory
      * ({@code requiredBehavior="must"}) immediate predecessors is still outstanding (see
-     * {@link #isOutstanding}). The immediate predecessors of step X are the prerequisites the
+     * {@link #isOutstandingStep}). The immediate predecessors of step X are the prerequisites the
      * normalized dependency graph records for it (see
      * {@link PlanDefinitionParser#buildDependencyGraph}).
      */
