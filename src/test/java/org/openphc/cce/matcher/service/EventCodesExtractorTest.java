@@ -249,6 +249,46 @@ class EventCodesExtractorTest {
                         "http://terminology.hl7.org/CodeSystem/condition-clinical", "active"))));
     }
 
+    // ── extractCodes — bare Coding (e.g. Encounter.class, which is a Coding, not a CodeableConcept) ──
+
+    @Test
+    void extractCodes_fromBareCodingClass() {
+        JsonNode event = toJsonNode(Map.of(
+                "resourceType", "Encounter",
+                "class", Map.of(
+                        "system", "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                        "code", "AMB",
+                        "display", "ambulatory"
+                )
+        ));
+        List<CodePathTriple> codes = extractor.extractCodes(event);
+        assertTrue(codes.stream().anyMatch(c ->
+                c.equals(new CodePathTriple("class",
+                        "http://terminology.hl7.org/CodeSystem/v3-ActCode", "AMB"))));
+    }
+
+    @Test
+    void extractCodes_bareCodingWithoutCode_fallsBackToDisplay() {
+        JsonNode event = toJsonNode(Map.of(
+                "resourceType", "Encounter",
+                "class", Map.of(
+                        "system", "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                        "display", "TRANSFER_ENCOUNTER" // no "code" — falls back to display, same as a coding[] entry would
+                )
+        ));
+        List<CodePathTriple> codes = extractor.extractCodes(event);
+        assertTrue(codes.stream().anyMatch(c ->
+                c.equals(new CodePathTriple("class",
+                        "http://terminology.hl7.org/CodeSystem/v3-ActCode", "TRANSFER_ENCOUNTER"))));
+    }
+
+    @Test
+    void extractCodes_classAbsent_yieldsNoCodesForThatPath() {
+        JsonNode event = toJsonNode(Map.of("resourceType", "Encounter"));
+        List<CodePathTriple> codes = extractor.extractCodes(event);
+        assertTrue(codes.stream().noneMatch(c -> c.path().equals("class")));
+    }
+
     // ── extractCodes — plain string status ──
 
     @Test

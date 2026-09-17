@@ -41,6 +41,7 @@ public class EventCodesExtractor {
             switch (triggerPath.shape()) {
                 case CODEABLE_CONCEPT -> extractCodingsFromPath(event, path, result);
                 case CODEABLE_CONCEPT_ARRAY -> extractCodingsFromArrayPath(event, path, result);
+                case CODING -> extractBareCoding(event, path, result);
                 case IDENTIFIER_ARRAY -> extractIdentifiers(event, path, result);
                 case PLAIN_STRING -> extractStringField(event, path, result);
             }
@@ -88,6 +89,18 @@ public class EventCodesExtractor {
                     addCodePathTriple(path, coding, result);
                 }
             }
+        }
+    }
+
+    /**
+     * Extract a coding from a field that is itself a bare FHIR Coding (e.g. {@code Encounter.class}) —
+     * {@code system}/{@code code}/{@code display} live directly on the field, with no wrapping
+     * {@code coding[]} array the way a CodeableConcept has one.
+     */
+    private void extractBareCoding(JsonNode event, String path, List<CodePathTriple> result) {
+        JsonNode node = event.get(path);
+        if (node != null && node.isObject()) {
+            addCodePathTriple(path, node, result);
         }
     }
 

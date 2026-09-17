@@ -271,7 +271,7 @@ Resource metadata is extracted from the CloudEvent **payload** (`data`), never f
 | Field | Extraction Paths |
 |---|---|
 | `resourceType` | `data.resourceType` (e.g., `"Observation"`, `"Encounter"`) |
-| `allCodes` | `data.code.coding[*]`, `data.class.coding[*]`, `data.serviceType.coding[*]`, `data.clinicalStatus.coding[*]`, `data.verificationStatus.coding[*]`, `data.type[*].coding[*]`, `data.category[*].coding[*]`, `data.identifier[*]` (system+value), `data.status` |
+| `allCodes` | `data.code.coding[*]`, `data.class` (bare `Coding` — no `.coding[*]`, see note below), `data.serviceType.coding[*]`, `data.clinicalStatus.coding[*]`, `data.verificationStatus.coding[*]`, `data.type[*].coding[*]`, `data.category[*].coding[*]`, `data.identifier[*]` (system+value), `data.status` |
 
 **These nine paths are the whole matchable surface**, and they are one list:
 [`TriggerPath`](../../cce-common-util/src/main/java/org/openphc/cce/common/fhir/TriggerPath.java) in
@@ -286,6 +286,15 @@ nothing: a path in the protocol's list but missing from the extractor's is index
 matched, and because Tier 1 requires *every* codeFilter of an action to match, one such path disables
 that action's trigger outright rather than loosening it. The reference ANC protocol's enrolment trigger
 was dead for exactly that reason.
+
+`TriggerPath` also carries, per member, which of these two shapes the field actually is —
+`CodeableConcept` (`{"coding": [...], "text": ...}`) or a bare `Coding` (`{"system": ..., "code": ...,
+"display": ...}` directly). `class` is the one CodeableConcept-looking path that is actually a bare
+Coding — `Encounter.class` is typed that way in FHIR R4, unlike every other single-object path here.
+Assuming every path is a CodeableConcept and reading `.coding[*]` off of `class` silently extracts
+nothing, which is a live failure mode: `visit-encounter`-style triggers filtering on `class=AMB` never
+matched a single real `Encounter`, correct or not, until the extractor learned to read a bare `Coding`
+directly off the field instead of assuming a `coding[]` wrapper.
 
 ### 4.2 Clinical Event Time Extraction
 
