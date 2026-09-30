@@ -191,12 +191,14 @@ ALTER TABLE step_sla_state_transition REPLICA IDENTITY FULL;
 
 DO $$
 BEGIN
-    -- Only meaningful while the old threshold columns are still present to read.
+    -- Only meaningful while the old threshold columns are still present to read. The test is on
+    -- missed_date, which only the 1.x step_instance has: due_date is in V1's table too, so testing
+    -- it would run this backfill on a new database and fail on s.missed_date.
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                    WHERE table_schema = 'public' AND table_name = 'step_instance'
-                     AND column_name = 'due_date')
+                     AND column_name = 'missed_date')
     THEN
-        RAISE NOTICE 'step_instance has no due_date; nothing to backfill';
+        RAISE NOTICE 'step_instance has no missed_date (not a 1.x shape); nothing to backfill';
         RETURN;
     END IF;
 
