@@ -174,12 +174,14 @@ public class MatcherEngine {
         UUID protocolInstanceId = UUID.fromString(protocolInstanceIdStr);
         ProtocolInstance protocolInstance = protocolInstanceService.findById(protocolInstanceId);
 
+        OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         StepInstance step = stepInstanceService.findActionableStep(protocolInstanceId, actionId);
         if (step == null) {
-            step = createInitialStep(protocolInstance, actionId);
+            step = createInitialStep(protocolInstance, actionId, now);
         }
 
-        stepInstanceService.completeStep(step, eventLog.getId(), event.getSource(), resolveOccurredAt(event));
+        stepInstanceService.completeStep(step, eventLog.getId(), event.getSource(),
+                notAfter(resolveOccurredAt(event), now));
 
         // Evaluate intelligence actions after step completion
         intelligenceActionEvaluator.evaluateOnCompletion(step, event.getData());
@@ -250,7 +252,8 @@ public class MatcherEngine {
         // processing clock, so enrolled_at and completed_at reflect when the patient actually
         // entered care and when the act actually happened — unaffected by ingestion lag (offline
         // sync, batch, DLQ replay). resolveOccurredAt falls back to the envelope time, then now().
-        OffsetDateTime occurredAt = resolveOccurredAt(event);
+        OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+        OffsetDateTime occurredAt = notAfter(resolveOccurredAt(event), now);
 
         // Idempotent — returns the existing instance if the patient is already enrolled
         ProtocolInstance protocolInstance = protocolInstanceService.enrollPatient(
@@ -261,7 +264,7 @@ public class MatcherEngine {
         StepInstance step = stepInstanceService.findActionableStep(
                 protocolInstance.getId(), actionId);
         if (step == null) {
-            step = createInitialStep(protocolInstance, actionId);
+            step = createInitialStep(protocolInstance, actionId, now);
         }
 
         stepInstanceService.completeStep(step, eventLog.getId(), event.getSource(), occurredAt);
@@ -281,7 +284,8 @@ public class MatcherEngine {
      *   <li>{@code now()} — defensive last resort (the envelope time is expected to always be present).</li>
      * </ol>
      * Non-FHIR ({@code application/json}) payloads skip extraction and use the envelope time directly.
-     * completeStep clamps the result to now(), so a bad/future source clock cannot push schedules out.
+     * Callers clamp the result with {@link #notAfter}, so a bad/future source clock cannot push
+     * schedules out.
      */
     private OffsetDateTime resolveOccurredAt(CloudEventMessage event) {
         if (isFhir(event)) {
@@ -303,13 +307,27 @@ public class MatcherEngine {
         return contentType == null || contentType.toLowerCase().contains("fhir");
     }
 
-    private StepInstance createInitialStep(ProtocolInstance protocolInstance, String actionId) {
+    /**
+     * The occurrence time, or {@code now} when it is later: work cannot have happened in the future.
+     *
+     * <p>{@code now} must be the same instant the event's {@link #createInitialStep} uses as the new
+     * step's due date — one reading of the clock per event. A source whose clock runs ahead, or that
+     * labels local time as UTC, sends a future occurrence time. Clamped to a second reading taken a
+     * moment after the due date, the completion of the very step the event created landed microseconds
+     * after its deadline: no {@code MET_CONDITION_REACHED} row, and an {@code OVERDUE} deviation for
+     * on-time work. Clamped to the same instant, it lands on the due date, which counts as on time.
+     */
+    private static OffsetDateTime notAfter(OffsetDateTime occurredAt, OffsetDateTime now) {
+        return occurredAt.isAfter(now) ? now : occurredAt;
+    }
+
+    /** A step the event itself brings into being: due at {@code now}, the event's single clock reading. */
+    private StepInstance createInitialStep(ProtocolInstance protocolInstance, String actionId, OffsetDateTime now) {
         PlanDefinitionParser.StepMetadata stepMetadata = parsedProtocolCache
                 .get(protocolInstance.getProtocolDefinition().getId(),
                         () -> protocolInstance.getProtocolDefinition().getDefinition().toString())
                 .step(actionId);
 
-        OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         OffsetDateTime missedDate = null;
         String requiredBehavior = null;
 
