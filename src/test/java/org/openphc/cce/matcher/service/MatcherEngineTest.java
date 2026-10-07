@@ -474,6 +474,144 @@ class MatcherEngineTest {
     }
 
     @Nested
+    class FutureDatedEvent {
+
+        // A source whose clock runs ahead, or that labels local time as UTC (Tiberbu sends Kenyan time
+        // with +00:00, three hours ahead), sends an occurrence time in the future. The step the event
+        // creates is due the moment it is created; completing it must not land after that moment, or
+        // the step reads as late (no MET row, an OVERDUE deviation) for work recorded on time.
+
+        @Test
+        void initialStep_isCompletedAtItsDueDate_andEnrolmentIsNotInTheFuture() {
+            OffsetDateTime threeHoursAhead = OffsetDateTime.now(ZoneOffset.UTC).plusHours(3);
+            CloudEventMessage event = buildEvent();
+            MatcherEventLog eventLog = buildEventLog(ProcessingStatus.ZERO_MATCH);
+            UUID protocolDefId = UUID.randomUUID();
+            ProtocolDefinition protocolDef = buildProtocolDefinition(protocolDefId);
+            ProtocolInstance protocolInstance = buildProtocolInstance(protocolDef);
+            StepInstance newStep = buildActionableStep(protocolInstance, "consent-request");
+
+            when(eventLogService.isDuplicate(anyString(), anyString())).thenReturn(false);
+            when(eventLogService.recordEvent(event, ProcessingStatus.ZERO_MATCH)).thenReturn(eventLog);
+            when(resourceTypeDetector.detect(event.getData())).thenReturn(ResourceType.Consent);
+            when(eventCodesExtractor.extractCodes(event.getData())).thenReturn(List.of());
+            when(triggerMatchingService.findStructuralMatches(eq(ResourceType.Consent), any()))
+                    .thenReturn(List.of(new MatchedStep(protocolDefId, "consent-request")));
+            when(triggerMatchingService.getConditionOnlyTriggers()).thenReturn(List.of());
+            when(protocolDefinitionService.findById(protocolDefId)).thenReturn(protocolDef);
+            stubProtocol(List.of(
+                    new PlanDefinitionParser.StepMetadata("consent-request", "Consent Requested",
+                            List.of(new PlanDefinitionParser.TriggerInfo(List.of(), null)),
+                            List.of(), null, null, "must", List.of())));
+            when(clinicalEventTimeExtractor.extract(eq(ResourceType.Consent), any())).thenReturn(threeHoursAhead);
+            when(protocolInstanceService.enrollPatient(eq("patient-1"), eq(protocolDef), any()))
+                    .thenReturn(protocolInstance);
+            when(stepInstanceService.findActionableStep(protocolInstance.getId(), "consent-request"))
+                    .thenReturn(null);
+            when(stepInstanceService.createStep(eq(protocolInstance), eq("consent-request"),
+                    eq(0), any(), any(), eq("must"))).thenReturn(newStep);
+
+            engine.processInboundEvent(event);
+            OffsetDateTime afterProcessing = OffsetDateTime.now(ZoneOffset.UTC);
+
+            ArgumentCaptor<OffsetDateTime> dueDate = ArgumentCaptor.forClass(OffsetDateTime.class);
+            verify(stepInstanceService).createStep(eq(protocolInstance), eq("consent-request"),
+                    eq(0), dueDate.capture(), any(), eq("must"));
+            ArgumentCaptor<OffsetDateTime> completedAt = ArgumentCaptor.forClass(OffsetDateTime.class);
+            verify(stepInstanceService).completeStep(eq(newStep), eq(eventLog.getId()), eq(event.getSource()),
+                    completedAt.capture());
+            ArgumentCaptor<OffsetDateTime> enrolledAt = ArgumentCaptor.forClass(OffsetDateTime.class);
+            verify(protocolInstanceService).enrollPatient(eq("patient-1"), eq(protocolDef), enrolledAt.capture());
+
+            assertEquals(dueDate.getValue(), completedAt.getValue(),
+                    "a step completed by the event that created it must land on its due date, not after it");
+            assertFalse(completedAt.getValue().isAfter(afterProcessing), "completed_at must not be in the future");
+            assertEquals(completedAt.getValue(), enrolledAt.getValue(), "enrolled_at must not be in the future either");
+        }
+
+        @Test
+        void explicitMatch_newStep_isCompletedAtItsDueDate() {
+            OffsetDateTime threeHoursAhead = OffsetDateTime.now(ZoneOffset.UTC).plusHours(3);
+            UUID protocolInstanceId = UUID.randomUUID();
+            ProtocolDefinition protocolDef = buildProtocolDefinition(UUID.randomUUID());
+            ProtocolInstance protocolInstance = buildProtocolInstance(protocolDef);
+            protocolInstance.setId(protocolInstanceId);
+            StepInstance newStep = buildActionableStep(protocolInstance, "new-action");
+
+            CloudEventMessage event = buildEvent();
+            event.setActionid("new-action");
+            event.setProtocolinstanceid(protocolInstanceId.toString());
+            MatcherEventLog eventLog = buildEventLog(ProcessingStatus.ZERO_MATCH);
+
+            when(eventLogService.isDuplicate(anyString(), anyString())).thenReturn(false);
+            when(eventLogService.recordEvent(event, ProcessingStatus.ZERO_MATCH)).thenReturn(eventLog);
+            when(protocolInstanceService.findById(protocolInstanceId)).thenReturn(protocolInstance);
+            when(stepInstanceService.findActionableStep(protocolInstanceId, "new-action")).thenReturn(null);
+            mockParserReturnsActionForInitialStep(protocolDef, "new-action", 3, "must");
+            when(resourceTypeDetector.detect(event.getData())).thenReturn(ResourceType.Observation);
+            when(clinicalEventTimeExtractor.extract(eq(ResourceType.Observation), any())).thenReturn(threeHoursAhead);
+            when(stepInstanceService.createStep(eq(protocolInstance), eq("new-action"),
+                    eq(0), any(), any(), eq("must"))).thenReturn(newStep);
+
+            engine.processInboundEvent(event);
+
+            ArgumentCaptor<OffsetDateTime> dueDate = ArgumentCaptor.forClass(OffsetDateTime.class);
+            ArgumentCaptor<OffsetDateTime> missedDate = ArgumentCaptor.forClass(OffsetDateTime.class);
+            verify(stepInstanceService).createStep(eq(protocolInstance), eq("new-action"),
+                    eq(0), dueDate.capture(), missedDate.capture(), eq("must"));
+            ArgumentCaptor<OffsetDateTime> completedAt = ArgumentCaptor.forClass(OffsetDateTime.class);
+            verify(stepInstanceService).completeStep(eq(newStep), eq(eventLog.getId()), eq(event.getSource()),
+                    completedAt.capture());
+
+            assertEquals(dueDate.getValue(), completedAt.getValue());
+            assertEquals(dueDate.getValue().plusDays(3), missedDate.getValue(), "missed date stays due date + tolerance");
+        }
+
+        @Test
+        void pastOccurrenceTime_isKept_andLandsBeforeTheDueDate() {
+            OffsetDateTime anHourAgo = OffsetDateTime.now(ZoneOffset.UTC).minusHours(1);
+            CloudEventMessage event = buildEvent();
+            MatcherEventLog eventLog = buildEventLog(ProcessingStatus.ZERO_MATCH);
+            UUID protocolDefId = UUID.randomUUID();
+            ProtocolDefinition protocolDef = buildProtocolDefinition(protocolDefId);
+            ProtocolInstance protocolInstance = buildProtocolInstance(protocolDef);
+            StepInstance newStep = buildActionableStep(protocolInstance, "first-step");
+
+            when(eventLogService.isDuplicate(anyString(), anyString())).thenReturn(false);
+            when(eventLogService.recordEvent(event, ProcessingStatus.ZERO_MATCH)).thenReturn(eventLog);
+            when(resourceTypeDetector.detect(event.getData())).thenReturn(ResourceType.Encounter);
+            when(eventCodesExtractor.extractCodes(event.getData())).thenReturn(List.of());
+            when(triggerMatchingService.findStructuralMatches(eq(ResourceType.Encounter), any()))
+                    .thenReturn(List.of(new MatchedStep(protocolDefId, "first-step")));
+            when(triggerMatchingService.getConditionOnlyTriggers()).thenReturn(List.of());
+            when(protocolDefinitionService.findById(protocolDefId)).thenReturn(protocolDef);
+            stubProtocol(List.of(
+                    new PlanDefinitionParser.StepMetadata("first-step", "First Step",
+                            List.of(new PlanDefinitionParser.TriggerInfo(List.of(), null)),
+                            List.of(), null, null, "must", List.of())));
+            when(clinicalEventTimeExtractor.extract(eq(ResourceType.Encounter), any())).thenReturn(anHourAgo);
+            when(protocolInstanceService.enrollPatient(eq("patient-1"), eq(protocolDef), any()))
+                    .thenReturn(protocolInstance);
+            when(stepInstanceService.findActionableStep(protocolInstance.getId(), "first-step"))
+                    .thenReturn(null);
+            when(stepInstanceService.createStep(eq(protocolInstance), eq("first-step"),
+                    eq(0), any(), any(), eq("must"))).thenReturn(newStep);
+
+            engine.processInboundEvent(event);
+
+            ArgumentCaptor<OffsetDateTime> dueDate = ArgumentCaptor.forClass(OffsetDateTime.class);
+            verify(stepInstanceService).createStep(eq(protocolInstance), eq("first-step"),
+                    eq(0), dueDate.capture(), any(), eq("must"));
+            ArgumentCaptor<OffsetDateTime> completedAt = ArgumentCaptor.forClass(OffsetDateTime.class);
+            verify(stepInstanceService).completeStep(eq(newStep), eq(eventLog.getId()), eq(event.getSource()),
+                    completedAt.capture());
+
+            assertEquals(anHourAgo, completedAt.getValue(), "a past occurrence time is the completion time as it is");
+            assertTrue(completedAt.getValue().isBefore(dueDate.getValue()));
+        }
+    }
+
+    @Nested
     class Metrics {
 
         @Test
