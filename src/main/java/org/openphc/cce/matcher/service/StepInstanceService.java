@@ -1,36 +1,34 @@
 package org.openphc.cce.matcher.service;
 
-import org.openphc.cce.common.sla.SlaThresholdReader;
-import org.openphc.cce.common.deviation.DeviationRecorder;
-import org.openphc.cce.common.intelligence.IntelligenceActionEvaluator;
-import org.openphc.cce.common.entity.Deviation;
 import org.openphc.cce.common.entity.ProtocolInstance;
-import org.openphc.cce.common.entity.ProtocolDefinition;
+import org.openphc.cce.common.entity.StepGroupInstance;
 import org.openphc.cce.common.entity.StepInstance;
-import org.openphc.cce.common.history.StateTransitionHistoryWriter;
-import org.openphc.cce.common.enums.DeviationType;
 import org.openphc.cce.common.enums.SlaStatus;
 import org.openphc.cce.common.enums.StepStatus;
-import org.openphc.cce.common.repository.StepInstanceRepository;
-import org.openphc.cce.common.fhir.ParsedProtocolCache;
 import org.openphc.cce.common.fhir.PlanDefinitionParser;
-import org.openphc.cce.common.support.RequiredBehavior;
+import org.openphc.cce.common.history.StateTransitionHistoryWriter;
+import org.openphc.cce.common.repository.StepInstanceRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
-import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.Comparator;
+import java.util.Optional;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
+/**
+ * The core of the matcher: which step instance an event completes, and completing it.
+ *
+ * <p>For a step in a group, the group instance the event goes to is chosen first (see
+ * {@link StepGroupService#groupInstanceForEvent}), then the step's instance in it.
+ *
+ * <p>What follows a completion is not part of it, so {@link MatcherEngine} runs it after this class is
+ * done: the order-violation check, progressive instantiation and backfill.
+ */
 @Service
 @Transactional
 public class StepInstanceService {
@@ -38,94 +36,148 @@ public class StepInstanceService {
     private static final Logger log = LoggerFactory.getLogger(StepInstanceService.class);
 
     private final StepInstanceRepository stepInstanceRepository;
-    private final ParsedProtocolCache parsedProtocolCache;
-    private final DeviationRecorder deviationRecorder;
-    private final IntelligenceActionEvaluator intelligenceActionEvaluator;
+    private final EnrollmentLoader enrollmentLoader;
     private final StateTransitionHistoryWriter stateTransitionHistoryWriter;
     private final StepSlaScheduleService slaScheduleService;
-    private final SlaThresholdReader slaThresholdReader;
+    private final StepGroupService stepGroupService;
+    private final StepCreationService stepCreationService;
 
     public StepInstanceService(StepInstanceRepository stepInstanceRepository,
-                               ParsedProtocolCache parsedProtocolCache,
-                               DeviationRecorder deviationRecorder,
-                               IntelligenceActionEvaluator intelligenceActionEvaluator,
+                               EnrollmentLoader enrollmentLoader,
                                StateTransitionHistoryWriter stateTransitionHistoryWriter,
                                StepSlaScheduleService slaScheduleService,
-                               SlaThresholdReader slaThresholdReader) {
+                               StepGroupService stepGroupService,
+                               StepCreationService stepCreationService) {
         this.stepInstanceRepository = stepInstanceRepository;
-        this.parsedProtocolCache = parsedProtocolCache;
-        this.deviationRecorder = deviationRecorder;
-        this.intelligenceActionEvaluator = intelligenceActionEvaluator;
+        this.enrollmentLoader = enrollmentLoader;
         this.stateTransitionHistoryWriter = stateTransitionHistoryWriter;
         this.slaScheduleService = slaScheduleService;
-        this.slaThresholdReader = slaThresholdReader;
+        this.stepGroupService = stepGroupService;
+        this.stepCreationService = stepCreationService;
     }
 
-    /**
-     * SLA statuses that can still move: a null status (no threshold judged yet) and {@link
-     * SlaStatus#OVERDUE}. {@link SlaStatus#MET} and {@link SlaStatus#MISSED} are settled outcomes with
-     * no threshold left to cross.
-     */
-    private static boolean isLiveSlaStatus(SlaStatus slaStatus) {
-        return slaStatus == null || slaStatus == SlaStatus.OVERDUE;
-    }
+    // ── Which step instance an event completes ──
 
     /**
-     * Create a new step instance: its event is {@link StepStatus#NOT_STARTED} and its {@code sla_status}
-     * is null — no threshold has fallen due, so there is nothing to judge yet. The Step SLA Service
-     * writes that column, never this service.
+     * The step instance an event for {@code stepActionId} completes: the one awaiting it, or a new one
+     * when none is.
+     * <ul>
+     *   <li>A step in a group: first the group instance the event goes to, under the enrollment's lock (see
+     *       {@link StepGroupService#groupInstanceForEvent}), then the step's open instance there. An earlier
+     *       cycle's open instance is never completed, whatever the event's clinical time.</li>
+     *   <li>A step outside any group: its open instance in the enrollment.</li>
+     * </ul>
+     * Of several open instances, the event completes the one whose due date is nearest its clinical time.
      *
-     * <p>The due date is recorded on the step: it is the deadline the work was expected by, and what
-     * the Step SLA Service measures {@code completed_at} against. The missed date is not, being readable
-     * from the {@code MISSED_DATE_REACHED} row that already carries it as both schedule and threshold.
-     * Either way the {@code step_sla_state_transition} rows are written in this same transaction, so the
-     * step and its SLA schedule commit or roll back together.
+     * <p>Opening a group instance creates its first mandatory steps, except the matched step: created with
+     * the rest, it would take the instance's due date, which is often unknown when an event opens it, and
+     * so would never be judged. The event creates it instead (see {@link #createStepInstanceForEvent}).
+     *
+     * @param now        the event's single clock reading: the due date of a step instance the event creates
+     * @param occurredAt the event's clinical time: which open instance it completes, which day it falls on,
+     *                   and the opening time of any group instance it opens
      */
-    public StepInstance createStep(ProtocolInstance protocolInstance, String actionId,
-                                   int repeatIndex, OffsetDateTime dueDate,
-                                   OffsetDateTime missedDate, String requiredBehavior) {
-        StepInstance step = StepInstance.builder()
-                .protocolInstance(protocolInstance)
-                .actionId(actionId)
-                .repeatIndex(repeatIndex)
-                .stepStatus(StepStatus.NOT_STARTED)
-                // sla_status stays null: no threshold has fallen due, so there is nothing to judge
-                // yet. The Step SLA Service is the only writer of that column.
-                //
-                // due_date is written here and never again. It is what that service settles MET
-                // against, so it has to be fixed before anything can be judged, and moving it later
-                // would redate every verdict already reached.
-                .dueDate(dueDate)
-                .requiredBehavior(requiredBehavior)
-                .build();
+    public StepInstance stepInstanceForEvent(ProtocolInstance protocolInstance, String stepActionId,
+                                             OffsetDateTime now, OffsetDateTime occurredAt) {
+        PlanDefinitionParser.StepMetadata matchedStepMetadata =
+                enrollmentLoader.parsedProtocol(protocolInstance).step(stepActionId);
+        if (matchedStepMetadata == null || matchedStepMetadata.groupId() == null) {
+            // Outside any group, or an action the protocol doesn't declare: there is no group instance to
+            // choose, so the step's open instance is looked for across the enrollment.
+            return findOpenStepInstance(protocolInstance, stepActionId, occurredAt)
+                    .orElseGet(() -> createStepInstanceForEvent(protocolInstance, stepActionId, matchedStepMetadata,
+                            now, null));
+        }
 
-        step = stepInstanceRepository.save(step);
-
-        slaScheduleService.schedule(step, dueDate, missedDate);
-
-        // Capture the initial NOT_STARTED status in append-only history.
-        stateTransitionHistoryWriter.recordStepInstanceTransition(step, step.getCreatedAt());
-
-        log.info("Created step instance: actionId={}, repeatIndex={}, instanceId={}, stepId={}, due={}, missed={}",
-                actionId, repeatIndex, protocolInstance.getId(), step.getId(), dueDate, missedDate);
-
-        return step;
+        // In a group: under the enrollment's lock, first the group instance the event goes to, then the
+        // step's open instance in it.
+        Enrollment enrollment = enrollmentLoader.lockAndLoad(protocolInstance);
+        StepGroupInstance groupInstance =
+                stepGroupService.groupInstanceForEvent(enrollment, matchedStepMetadata, occurredAt);
+        return findOpenStepInstanceIn(enrollment, groupInstance, stepActionId, occurredAt)
+                .orElseGet(() -> createStepInstanceForEvent(protocolInstance, stepActionId, matchedStepMetadata,
+                        now, groupInstance));
     }
 
     /**
-     * Complete a step instance: record that its event arrived and settle its SLA,
-     * trigger progressive step instantiation for dependent steps, and materialize mandatory
-     * steps the journey never recorded (see {@link #backfillMissingMandatorySteps}).
+     * Finds {@code stepActionId}'s open step instance in the enrollment, for a step outside any group. It
+     * creates nothing. Open means its event has not arrived, whatever its SLA: a step whose SLA is already
+     * MISSED is still picked up by a late event rather than a duplicate being created for it.
+     */
+    private Optional<StepInstance> findOpenStepInstance(ProtocolInstance protocolInstance, String stepActionId,
+                                                    OffsetDateTime occurredAt) {
+        return stepInstanceRepository.findByProtocolInstanceIdAndActionIdAndStepStatus(
+                        protocolInstance.getId(), stepActionId, StepStatus.NOT_STARTED).stream()
+                .min(nearestDueDate(occurredAt));
+    }
+
+    /**
+     * Finds {@code stepActionId}'s open step instance in {@code groupInstance} itself. It creates nothing.
+     */
+    private static Optional<StepInstance> findOpenStepInstanceIn(Enrollment enrollment,
+                                                                 StepGroupInstance groupInstance,
+                                                                 String stepActionId, OffsetDateTime occurredAt) {
+        return enrollment.stepInstancesOf(stepActionId).stream()
+                .filter(stepInstance -> stepInstance.getStepStatus() == StepStatus.NOT_STARTED
+                        && StepInstanceScope.isDirectlyIn(stepInstance, groupInstance))
+                .min(nearestDueDate(occurredAt));
+    }
+
+    /**
+     * Open step instances in the order an event at {@code occurredAt} takes them: the due date nearest the
+     * event's clinical time first, ties to the earlier due date; instances with no due date after dated
+     * ones, oldest first.
+     */
+    private static Comparator<StepInstance> nearestDueDate(OffsetDateTime occurredAt) {
+        return Comparator.<StepInstance, Boolean>comparing(stepInstance -> stepInstance.getDueDate() == null)
+                .thenComparingLong(stepInstance -> stepInstance.getDueDate() == null
+                        ? 0L : Math.abs(Duration.between(occurredAt, stepInstance.getDueDate()).toMillis()))
+                .thenComparing(StepInstance::getDueDate, Comparator.nullsLast(Comparator.naturalOrder()))
+                .thenComparing(StepInstance::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder()));
+    }
+
+    /**
+     * The step instance an event brings into being when none awaits it: one instance, due at {@code now},
+     * the event's single clock reading, and missed {@code tolerance-days} after that. An action the
+     * protocol doesn't declare, which an explicit match can name, gets a bare step instance with no
+     * deadline.
+     */
+    private StepInstance createStepInstanceForEvent(ProtocolInstance protocolInstance, String stepActionId,
+                                                    PlanDefinitionParser.StepMetadata matchedStepMetadata,
+                                                    OffsetDateTime now, StepGroupInstance groupInstance) {
+        if (matchedStepMetadata == null) {
+            // An explicit match can name an action the protocol doesn't declare: a bare step instance, with
+            // no deadline.
+            return stepCreationService.createStep(protocolInstance, stepActionId, 0, now, null, null);
+        }
+        // tolerance-days is the single grace window: missedDate = dueDate + tolerance.
+        OffsetDateTime missedDate = matchedStepMetadata.toleranceDays() != null
+                ? now.plusDays(matchedStepMetadata.toleranceDays())
+                : null;
+        return stepCreationService.createStep(protocolInstance, matchedStepMetadata.id(), 0, now, missedDate,
+                matchedStepMetadata.requiredBehavior(), groupInstance);
+    }
+
+    // ── Completing a step instance ──
+
+    /**
+     * Complete a step instance: record that its event arrived, and schedule the judgement of whether it was
+     * on time. What follows from the completion is not part of it: {@link MatcherEngine#processMatchedStep}
+     * runs that next. Package-private so that only the matcher's own flow completes a step instance; a
+     * caller that completed one on its own would skip the order-violation check, progressive instantiation
+     * and backfill.
      *
      * <p>Completability depends only on {@link StepStatus} — a step whose SLA is already
-     * {@link SlaStatus#MISSED} can still be completed by a late event. The row then records both
-     * facts: the event arrived, and the SLA was missed.
+     * {@link SlaStatus#MISSED} can still be completed by a late event. The step instance then records
+     * both facts: the event arrived, and the SLA was missed.
      */
-    public void completeStep(StepInstance step, UUID matchedEventId, String completedBySource,
-                             OffsetDateTime occurredAt) {
-        if (step.getStepStatus() != StepStatus.NOT_STARTED) {
+    void completeStepInstance(StepInstance stepInstance, UUID matchedEventId, String completedBySource,
+                              OffsetDateTime occurredAt) {
+        if (stepInstance.getStepStatus() != StepStatus.NOT_STARTED) {
+            // A step instance completes once. Refusing a second completion keeps what follows it, an order
+            // violation among them, to a single run.
             throw new IllegalStateException(
-                    "Cannot complete step with stepStatus " + step.getStepStatus() + ": " + step.getId());
+                    "Cannot complete step with stepStatus " + stepInstance.getStepStatus() + ": " + stepInstance.getId());
         }
 
         // completedAt is the clinical occurrence time (when the act happened), not the ingestion
@@ -136,377 +188,26 @@ public class StepInstanceService {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         OffsetDateTime completedAt = (occurredAt != null && !occurredAt.isAfter(now)) ? occurredAt : now;
 
-        // Read once, to anchor an after-start dependent to when this step became active. Not used to
-        // settle this step's own SLA: that is the Step SLA Service's judgement, made on its next
-        // sweep, by comparing the completed_at recorded below against each threshold.
-        SlaThresholdReader.SlaThresholds thresholds = slaThresholdReader.getThresholds(step.getId());
-
         // sla_status is deliberately left alone. Recording that the work happened and judging whether
         // it was timely are different questions with different owners; this service only schedules the
         // second one (below), and writing both here is what used to require a rule about which service
         // may overwrite the other.
-        step.setStepStatus(StepStatus.COMPLETED);
-        step.setCompletedAt(completedAt);
-        step.setMatchedEventId(matchedEventId);
-        step.setCompletedBySource(completedBySource);
+        stepInstance.setStepStatus(StepStatus.COMPLETED);
+        stepInstance.setCompletedAt(completedAt);
+        stepInstance.setMatchedEventId(matchedEventId);
+        stepInstance.setCompletedBySource(completedBySource);
 
-        stepInstanceRepository.save(step);
+        stepInstanceRepository.save(stepInstance);
 
         // Work recorded by the deadline is a verdict waiting to be written, so schedule it now.
         // The Step SLA Service takes the row on its next cycle; without it, a step completed weeks
         // early would sit unjudged until its due date arrived.
-        slaScheduleService.scheduleMetIfOnTime(step, completedAt);
+        slaScheduleService.scheduleMetIfOnTime(stepInstance, completedAt);
 
         // Capture the COMPLETED transition in append-only history.
-        stateTransitionHistoryWriter.recordStepInstanceTransition(step, now);
-
+        stateTransitionHistoryWriter.recordStepInstanceTransition(stepInstance, now);
 
         log.info("Completed step: stepId={}, actionId={}, completedAt={} (SLA judged by the Step SLA Service)",
-                step.getId(), step.getActionId(), completedAt);
-
-        // The flattened steps and the normalized relatedAction graph — all three passes below
-        // traverse them.
-        ProtocolDefinition protocolDef = step.getProtocolInstance().getProtocolDefinition();
-        ParsedProtocolCache.ParsedProtocol protocol =
-                parsedProtocolCache.get(protocolDef.getId(),
-                        () -> protocolDef.getDefinition().toString());
-        List<PlanDefinitionParser.StepMetadata> steps = protocol.steps();
-        PlanDefinitionParser.DependencyGraph graph = protocol.dependencyGraph();
-
-        // This instance's step rows, read once and threaded through all three passes.
-        //
-        // Mutable by design: each pass that creates a row appends it here, so a later pass sees work
-        // created earlier in this same transaction. createDependentSteps relies on that for diamond
-        // dependencies (a step waiting on both this completion and one of its other dependents), and
-        // backfillMissingMandatorySteps relies on it to avoid re-creating a mandatory step that
-        // progressive instantiation just materialized.
-        List<StepInstance> siblings = new ArrayList<>(
-                stepInstanceRepository.findByProtocolInstanceId(step.getProtocolInstance().getId()));
-
-        detectOrderViolations(step, steps, graph, siblings);
-        createDependentSteps(step, graph, siblings, thresholds);
-        backfillMissingMandatorySteps(step, steps, graph, siblings);
+                stepInstance.getId(), stepInstance.getActionId(), completedAt);
     }
-
-    /**
-     * Find the first step still awaiting its event for a given protocol instance and actionId.
-     * Returns null if none is outstanding.
-     *
-     * <p>Scoped by {@link StepStatus} alone, so a step whose SLA is already MISSED is still picked
-     * up by a late event rather than a duplicate row being created for it.
-     */
-    @Transactional(readOnly = true)
-    public StepInstance findActionableStep(UUID protocolInstanceId, String actionId) {
-        List<StepInstance> steps = stepInstanceRepository
-                .findByProtocolInstanceIdAndActionIdAndStepStatus(
-                        protocolInstanceId, actionId, StepStatus.NOT_STARTED);
-        return steps.isEmpty() ? null : steps.get(0);
-    }
-
-    /**
-     * Whether a step is still genuinely outstanding: its event has not arrived and its SLA can
-     * still move. Excludes SLAs already settled — {@code MISSED}, written off, and {@code MET},
-     * recorded on time. {@code OVERDUE} is not settled: a late event can still complete such a step.
-     */
-    private boolean isOutstandingStep(StepInstance step) {
-        return step.getStepStatus() == StepStatus.NOT_STARTED && isLiveSlaStatus(step.getSlaStatus());
-    }
-
-    /**
-     * Detect order violations: when a step completes, check whether any of its mandatory
-     * ({@code requiredBehavior="must"}) immediate predecessors is still outstanding (see
-     * {@link #isOutstandingStep}). The immediate predecessors of step X are the prerequisites the
-     * normalized dependency graph records for it (see
-     * {@link PlanDefinitionParser#buildDependencyGraph}).
-     */
-    private void detectOrderViolations(StepInstance completedStep,
-                                       List<PlanDefinitionParser.StepMetadata> steps,
-                                       PlanDefinitionParser.DependencyGraph graph,
-                                       List<StepInstance> siblings) {
-        String completedStepId = completedStep.getActionId();
-
-        Set<String> mustStepIds = PlanDefinitionParser.mustStepIds(steps);
-
-        // Immediate predecessors of this step, restricted to mandatory ones
-        List<String> mustPredecessorIds = graph.predecessorsOf(completedStepId).stream()
-                .distinct()
-                .filter(mustStepIds::contains)
-                .toList();
-
-        if (mustPredecessorIds.isEmpty()) {
-            return;
-        }
-
-        // Check if any must-predecessor steps are still in actionable (incomplete) states
-        List<String> incompletePrerequisites = new ArrayList<>();
-        for (String predecessorId : mustPredecessorIds) {
-            boolean hasIncomplete = siblings.stream()
-                    .filter(s -> predecessorId.equals(s.getActionId()))
-                    .anyMatch(this::isOutstandingStep);
-            if (hasIncomplete) {
-                incompletePrerequisites.add(predecessorId);
-            }
-        }
-
-        if (!incompletePrerequisites.isEmpty()) {
-            Map<String, Object> metadata = new LinkedHashMap<>();
-            metadata.put("incompletePrerequisites", incompletePrerequisites);
-            // Key kept as-is: it is persisted in deviation.metadata and read downstream.
-            metadata.put("completedActionId", completedStepId);
-
-            // Once per step: completeStep refuses a step that is not NOT_STARTED, so this cannot run
-            // twice for one step.
-            Deviation deviation = deviationRecorder.recordDeviation(completedStep,
-                    DeviationType.ORDER_VIOLATION, metadata);
-
-            log.warn("Order violation detected: step {} (actionId={}) completed while "
-                            + "prerequisite steps {} are still incomplete",
-                    completedStep.getId(), completedStepId, incompletePrerequisites);
-
-            intelligenceActionEvaluator.evaluateOnDeviation(completedStep, deviation);
-        }
-    }
-
-    /**
-     * Progressive step instantiation: when a step completes, create the PENDING steps that declare
-     * it as a prerequisite, with due dates calculated from their own {@code relatedAction} offsets.
-     *
-     * <p>{@code relatedAction} is relative rather than forward — a step states how it sits against
-     * another — so the forward direction needed here comes from the normalized graph (see
-     * {@link PlanDefinitionParser#buildDependencyGraph}). The offset that positions a dependent step
-     * is the one on the edge between it and this prerequisite, whichever end declared it.
-     */
-    private void createDependentSteps(StepInstance completedStep,
-                                      PlanDefinitionParser.DependencyGraph graph,
-                                      List<StepInstance> siblings,
-                                      SlaThresholdReader.SlaThresholds completedThresholds) {
-        ProtocolInstance protocolInstance = completedStep.getProtocolInstance();
-
-        // Steps that depend on the just-completed step
-        List<PlanDefinitionParser.StepDependency> dependents =
-                graph.successorsOf(completedStep.getActionId());
-
-        if (dependents.isEmpty()) {
-            return;
-        }
-
-        for (PlanDefinitionParser.StepDependency dependent : dependents) {
-            PlanDefinitionParser.StepMetadata targetStep = dependent.step();
-            PlanDefinitionParser.RelatedStepInfo edge = dependent.edge();
-
-            // Dedup guard: skip if an instance for this step already exists.
-            // A target may already exist because it was created reactively by its own
-            // trigger (createInitialStep) before its predecessor completed, or because a
-            // redelivered event re-completed the predecessor. Without this guard, progressive
-            // instantiation would create a duplicate step that later goes overdue/missed and
-            // raises a spurious deviation.
-            if (stepInstanceRepository.existsByProtocolInstanceIdAndActionId(
-                    protocolInstance.getId(), targetStep.id())) {
-                log.debug("Skipping progressive instantiation of {} — an instance for this step already exists (instanceId={})",
-                        targetStep.id(), protocolInstance.getId());
-                continue;
-            }
-
-            String requiredBehavior = targetStep.requiredBehavior();
-
-            // Only pre-create PENDING instances for mandatory (must) steps. Optional steps
-            // (could / unspecified) are not instantiated on predecessor completion:
-            // we may never receive their events, and a dangling PENDING row would later be
-            // driven to MISSED and raise a spurious deviation. When an optional step's
-            // event does arrive, MatcherEngine.processMatch creates the instance on the fly
-            // (createInitialStep) and completes it in the same transaction.
-            if (!RequiredBehavior.isMandatory(requiredBehavior)) {
-                log.debug("Skipping progressive instantiation of non-mandatory step {} "
-                                + "(requiredBehavior={}, instanceId={})",
-                        targetStep.id(), requiredBehavior, protocolInstance.getId());
-                continue;
-            }
-
-            // Fan-in: a step may declare several prerequisites. Wait while any of the others is
-            // still in flight, so the due date anchors to the last prerequisite to finish rather
-            // than whichever happened to complete first — each of their completions re-runs this
-            // method, so the wait resolves itself.
-            String blockingPrerequisite = firstInFlightPrerequisite(
-                    graph.predecessorsOf(targetStep.id()), completedStep.getActionId(), siblings);
-            if (blockingPrerequisite != null) {
-                log.debug("Deferring progressive instantiation of {} — prerequisite {} is still in flight (instanceId={})",
-                        targetStep.id(), blockingPrerequisite, protocolInstance.getId());
-                continue;
-            }
-
-            // after-start: offset from when the prerequisite became active (its scheduled due date)
-            // after-end / after (default): offset from when the prerequisite completed (completedAt)
-            OffsetDateTime baseTime = "after-start".equals(edge.relationship())
-                    ? completedThresholds.dueDate()
-                    : completedStep.getCompletedAt();
-            if (baseTime == null) {
-                baseTime = completedStep.getCompletedAt();
-            }
-            OffsetDateTime dueDate = calculateDueDate(baseTime, edge);
-
-            // Create step instances — if timing specifies recurring, create N instances
-            int repeatCount = 1;
-            java.math.BigDecimal repeatPeriod = null;
-            String repeatPeriodUnit = null;
-            if (targetStep.timing() != null) {
-                PlanDefinitionParser.TimingInfo timing = targetStep.timing();
-                if (timing.count() != null && timing.count() > 1) {
-                    repeatCount = timing.count();
-                    repeatPeriod = timing.period();
-                    repeatPeriodUnit = timing.periodUnit();
-                }
-            }
-
-            for (int i = 0; i < repeatCount; i++) {
-                OffsetDateTime instanceDueDate = dueDate;
-                if (i > 0 && repeatPeriod != null && repeatPeriodUnit != null) {
-                    instanceDueDate = addOffset(dueDate, repeatPeriod.longValue() * i, repeatPeriodUnit);
-                }
-
-                // tolerance-days is now the single grace window: missedDate = dueDate + tolerance.
-                OffsetDateTime instanceMissedDate = null;
-                if (targetStep.toleranceDays() != null) {
-                    instanceMissedDate = instanceDueDate.plusDays(targetStep.toleranceDays());
-                }
-
-                siblings.add(createStep(protocolInstance, targetStep.id(),
-                        i, instanceDueDate, instanceMissedDate,
-                        requiredBehavior));
-
-                log.info("Progressive instantiation: created step {} (repeat {}/{}) due at {} (triggered by {}, relationship={})",
-                        targetStep.id(), i, repeatCount, instanceDueDate,
-                        completedStep.getActionId(), edge.relationship());
-            }
-        }
-    }
-
-    /**
-     * The first prerequisite of {@code targetStep}, other than the one that just completed, that
-     * still has an actionable (in-flight) step instance — or null when none does.
-     *
-     * <p>A prerequisite with no instance at all does not block: it may never be recorded, and
-     * waiting on it would strand the dependent step forever. Neither does one whose SLA has already
-     * settled, which will never complete later than now.
-     */
-    private String firstInFlightPrerequisite(List<String> prerequisiteIds,
-                                             String completedActionId,
-                                             List<StepInstance> siblings) {
-        for (String prerequisiteId : prerequisiteIds) {
-            if (prerequisiteId.equals(completedActionId)) {
-                continue;
-            }
-            boolean inFlight = siblings.stream()
-                    .filter(s -> prerequisiteId.equals(s.getActionId()))
-                    .anyMatch(this::isOutstandingStep);
-            if (inFlight) {
-                return prerequisiteId;
-            }
-        }
-        return null;
-    }
-
-
-    /**
-     * Materialize the mandatory steps the journey should already have recorded. Progressive
-     * instantiation only works forward from a completed step, so a step created reactively from its
-     * own trigger (see {@code MatcherEngine.createInitialStep}) leaves the mandatory steps that
-     * should have preceded it with no row at all — they read as "not started" in the journey view
-     * and are invisible to the scheduler, so they never surface as a deviation. On every completion,
-     * any mandatory predecessor of the progress observed so far (see
-     * {@link PlanDefinitionParser#computeMustPredecessorSteps}) that has no step instance is created
-     * in PENDING state.
-     *
-     * <p>Scoped to predecessors — work that is already late — and never to mandatory steps still
-     * ahead in the chain. Materializing those would stamp them with this completion's time and so
-     * flatten the due dates their own {@code relatedAction} offsets define (e.g. lab-results' +3d
-     * after lab-order); they are left to progressive instantiation, which creates them on their
-     * predecessor's completion with the intended schedule.
-     *
-     * <p>Runs after {@link #detectOrderViolations} deliberately: backfilled rows must not count as
-     * incomplete prerequisites for the completion that revealed them, so this does not invent an
-     * ORDER_VIOLATION at completion time. A mandatory step that is never recorded is instead caught
-     * by the scheduler driving the backfilled row DUE and then MISSED. If its event does arrive
-     * later, {@link #findActionableStep} picks the row up and completes it (LATE).
-     *
-     * <p>Idempotent: a mandatory step that already has any step instance — in any state, whether
-     * pre-existing or created earlier in this same transaction by progressive instantiation — is
-     * left alone.
-     */
-    private void backfillMissingMandatorySteps(StepInstance completedStep,
-                                               List<PlanDefinitionParser.StepMetadata> steps,
-                                               PlanDefinitionParser.DependencyGraph graph,
-                                               List<StepInstance> siblings) {
-        ProtocolInstance protocolInstance = completedStep.getProtocolInstance();
-
-        Set<String> observedStepIds = siblings.stream()
-                .map(StepInstance::getActionId)
-                .collect(Collectors.toSet());
-
-        List<String> missingMustSteps = PlanDefinitionParser
-                .computeMustPredecessorSteps(observedStepIds, steps, graph).stream()
-                .filter(stepId -> !observedStepIds.contains(stepId))
-                .sorted()
-                .toList();
-
-        if (missingMustSteps.isEmpty()) {
-            return;
-        }
-
-        // Anchor to the clinical time of the completion that revealed the gap. Every backfilled step
-        // is a prerequisite that should already have happened, so they are all equally past due —
-        // there is no future schedule left to preserve among them — and this keeps them on clinical
-        // time rather than the ingestion clock.
-        OffsetDateTime dueDate = completedStep.getCompletedAt() != null
-                ? completedStep.getCompletedAt()
-                : OffsetDateTime.now(ZoneOffset.UTC);
-
-        Map<String, PlanDefinitionParser.StepMetadata> stepsById = steps.stream()
-                .collect(Collectors.toMap(PlanDefinitionParser.StepMetadata::id, s -> s, (a, b) -> a));
-
-        for (String stepId : missingMustSteps) {
-            PlanDefinitionParser.StepMetadata stepMetadata = stepsById.get(stepId);
-
-            OffsetDateTime missedDate = null;
-            if (stepMetadata != null && stepMetadata.toleranceDays() != null) {
-                missedDate = dueDate.plusDays(stepMetadata.toleranceDays());
-            }
-
-            // One instance (repeatIndex 0) regardless of the step's timing.repeat count: this is a
-            // placeholder for work that was never recorded, not a scheduled recurrence.
-            siblings.add(createStep(protocolInstance, stepId, 0, dueDate, missedDate, "must"));
-
-            log.info("Backfilled unrecorded mandatory step {} as PENDING due at {} "
-                            + "(revealed by completion of {}, instanceId={})",
-                    stepId, dueDate, completedStep.getActionId(), protocolInstance.getId());
-        }
-    }
-
-    private OffsetDateTime calculateDueDate(OffsetDateTime baseTime,
-                                            PlanDefinitionParser.RelatedStepInfo relatedStep) {
-        if (relatedStep.offsetValue() == null) {
-            return baseTime;
-        }
-
-        long offsetAmount = relatedStep.offsetValue().longValue();
-        String unit = relatedStep.offsetUnit();
-
-        if (unit == null) {
-            return baseTime;
-        }
-
-        return addOffset(baseTime, offsetAmount, unit);
-    }
-
-    private OffsetDateTime addOffset(OffsetDateTime base, long amount, String unit) {
-        return switch (unit) {
-            case "d" -> base.plus(amount, ChronoUnit.DAYS);
-            case "h" -> base.plus(amount, ChronoUnit.HOURS);
-            case "min" -> base.plus(amount, ChronoUnit.MINUTES);
-            case "wk" -> base.plus(amount * 7, ChronoUnit.DAYS);
-            case "mo" -> base.plusMonths(amount);
-            case "a" -> base.plusYears(amount);
-            default -> throw new IllegalArgumentException("Unknown time unit: " + unit);
-        };
-    }
-
 }

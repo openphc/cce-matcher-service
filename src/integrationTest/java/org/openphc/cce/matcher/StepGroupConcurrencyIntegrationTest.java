@@ -1,0 +1,142 @@
+package org.openphc.cce.matcher;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.RepeatedTest;
+import org.openphc.cce.common.entity.ProtocolDefinition;
+import org.openphc.cce.common.event.CloudEventMessage;
+import org.openphc.cce.common.entity.ProtocolInstance;
+import org.openphc.cce.common.entity.StepGroupInstance;
+import org.openphc.cce.common.entity.StepInstance;
+import org.openphc.cce.common.enums.ProtocolInstanceStatus;
+import org.openphc.cce.common.enums.StepStatus;
+import org.openphc.cce.common.repository.ProtocolInstanceRepository;
+import org.openphc.cce.common.repository.StepGroupInstanceRepository;
+import org.openphc.cce.common.repository.StepInstanceRepository;
+import org.openphc.cce.matcher.service.MatcherEngine;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.io.IOException;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * The first events for two steps of one unopened group, processed in concurrent transactions. Each would
+ * find no instance and open the group, so without the enrollment lock the group could open twice, or a
+ * step could get a second row.
+ */
+class StepGroupConcurrencyIntegrationTest extends IntegrationTestBase {
+
+    private static final String FIXTURE = "src/integrationTest/resources/fhir/plan-definition-step-group.json";
+
+    @Autowired
+    private MatcherEngine matcherEngine;
+
+    @Autowired
+    private StepInstanceRepository stepInstanceRepository;
+
+    @Autowired
+    private StepGroupInstanceRepository stepGroupInstanceRepository;
+
+    @Autowired
+    private ProtocolInstanceRepository protocolInstanceRepository;
+
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    private TransactionTemplate tx;
+    private ProtocolDefinition protocolDefinition;
+
+    @BeforeEach
+    void seedProtocol() throws IOException {
+        tx = new TransactionTemplate(transactionManager);
+        UUID protocolDefinitionId = seedProtocolRows(FIXTURE, "1.0.0-group-concurrency");
+        protocolDefinition = protocolDefinitionRepository.findById(protocolDefinitionId).orElseThrow();
+    }
+
+    @RepeatedTest(10)
+    void twoFirstEventsAtOnce_openOneGroupInstance_withOneRowPerStep() throws Exception {
+        OffsetDateTime at = OffsetDateTime.now(ZoneOffset.UTC).minusHours(1).truncatedTo(ChronoUnit.MICROS);
+        UUID enrollmentId = enroll(at);
+
+        recordAtOnce(enrollmentId, List.of("bp", "weight"), at);
+
+        List<StepGroupInstance> visits = stepGroupInstanceRepository.findAll().stream()
+                .filter(g -> enrollmentId.equals(g.getProtocolInstance().getId()) && "visit".equals(g.getGroupActionId()))
+                .toList();
+        assertThat(visits).hasSize(1);
+        List<StepInstance> rows = stepInstanceRepository.findByProtocolInstanceId(enrollmentId);
+        assertThat(rows).extracting(StepInstance::getActionId).containsExactlyInAnyOrder("bp", "weight");
+        assertThat(rows).allMatch(row -> visits.get(0).getId().equals(row.getStepGroupInstance().getId()));
+        assertThat(rows).allMatch(row -> row.getStepStatus() == StepStatus.COMPLETED);
+    }
+
+    private UUID enroll(OffsetDateTime at) {
+        return tx.execute(status -> protocolInstanceRepository.save(ProtocolInstance.builder()
+                .patientId("patient-group-concurrency-" + UUID.randomUUID())
+                .protocolDefinition(protocolDefinition)
+                .enrolledAt(at)
+                .status(ProtocolInstanceStatus.ACTIVE)
+                .build()).getId());
+    }
+
+    /**
+     * Sends each event through {@link MatcherEngine} as an explicit match, each in its own transaction:
+     * find or create the step's row in the instance the event goes to, complete it, then run what follows
+     * from the completion. Both start together, so each looks for the instance while the other may be
+     * opening it.
+     */
+    private void recordAtOnce(UUID enrollmentId, List<String> actionIds, OffsetDateTime at) throws Exception {
+        CyclicBarrier bothStarted = new CyclicBarrier(actionIds.size());
+        ExecutorService pool = Executors.newFixedThreadPool(actionIds.size());
+        try {
+            List<Future<?>> events = actionIds.stream()
+                    .<Future<?>>map(actionId -> pool.submit(() -> {
+                        CloudEventMessage event = explicitEvent(enrollmentId, actionId, at);
+                        await(bothStarted);
+                        matcherEngine.processInboundEvent(event);
+                    }))
+                    .toList();
+            for (Future<?> event : events) {
+                event.get(30, SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /** An event that names its enrollment and step, so it skips trigger matching. */
+    private static CloudEventMessage explicitEvent(UUID enrollmentId, String actionId, OffsetDateTime at) {
+        return CloudEventMessage.builder()
+                .id(UUID.randomUUID().toString())
+                .source("integration-test")
+                .type("org.openphc.test")
+                .specversion("1.0")
+                .time(at)
+                .datacontenttype("application/json")
+                .protocolinstanceid(enrollmentId.toString())
+                .actionid(actionId)
+                .data(new ObjectMapper().createObjectNode())
+                .build();
+    }
+
+    private static void await(CyclicBarrier barrier) {
+        try {
+            barrier.await(10, SECONDS);
+        } catch (Exception e) {
+            throw new IllegalStateException("The two events were not processed together", e);
+        }
+    }
+}

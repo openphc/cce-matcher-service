@@ -22,6 +22,7 @@ sequenceDiagram
     participant ExprEval as FhirExpressionEvaluator<br/>(JSONLogic + FHIRPath)
     participant ProtoInst as ProtocolInstanceService
     participant StepInst as StepInstanceService
+    participant FollowUps as OrderViolationDetector,<br/>ProgressiveInstantiationService,<br/>MandatoryStepBackfillService
     participant Intel as IntelligenceActionEvaluator
     participant DB as PostgreSQL
 
@@ -109,17 +110,20 @@ sequenceDiagram
                     ProtoInst-->>Engine: protocolInstance
 
                     Engine->>Engine: resolveOccurredAt(event)<br/>(clinical time from payload → envelope time → now)
-                    Engine->>StepInst: findActionableStep(protocolInstanceId, actionId)
-                    alt No actionable step exists yet
-                        Engine->>StepInst: createStep(protocol, actionId, 0, now, ...)
-                        StepInst->>DB: INSERT INTO step_instance (step_status=NOT_STARTED, sla_status=NULL)
+                    Engine->>StepInst: stepInstanceForEvent(protocolInstance, actionId, now, occurredAt)
+                    Note over StepInst: In a group: the group instance first (StepGroupService),<br/>then the step's open instance there. Outside any group:<br/>the open instance whose due date is nearest occurredAt
+                    alt No open step instance
+                        StepInst->>DB: INSERT INTO step_instance (step_status=NOT_STARTED, sla_status=NULL, due now)
                     end
 
-                    Engine->>StepInst: completeStep(step, eventLogId, source, occurredAt)
-                    Note over StepInst: Single call — internally sets completed_at (clinical time,<br/>clamped to now), detects order violations, runs progressive<br/>instantiation of mandatory dependents (see §9), backfills<br/>unrecorded mandatory predecessors (see §9). Does NOT set<br/>sla_status — timeliness is the Step SLA Service's call
+                    Engine->>StepInst: completeStepInstance(stepInstance, eventLogId, source, occurredAt)
+                    Note over StepInst: Records the completion only: sets completed_at (clinical time,<br/>clamped to now). Does NOT set sla_status —<br/>timeliness is the Step SLA Service's call
                     StepInst->>DB: UPDATE step_instance SET step_status=COMPLETED,<br/>completed_at, matched_event_id
 
-                    Engine->>Intel: evaluateOnCompletion(step, eventPayload)
+                    Engine->>FollowUps: what follows the completion, in order (see §9):<br/>detectOrderViolations → instantiateDependents → backfillMissingMandatorySteps
+                    Note over FollowUps: Run by MatcherEngine on the enrollment read under its lock<br/>(EnrollmentLoader.lockAndLoad)
+
+                    Engine->>Intel: evaluateOnCompletion(stepInstance, eventPayload)
 
                 end
                 Engine->>EventLog: updateStatus(eventLog, MATCHED)
@@ -135,10 +139,10 @@ sequenceDiagram
 ## 2. Protocol Read Model & Cache Reconciliation
 
 Matcher does not load protocols. `protocol_definition`, `trigger_index` and `action_definition` are
-written by the CCE Protocol Service; Matcher only reads them.
+written by the CCE Protocol Service. Matcher only reads them.
 
 Tier 1 reads `trigger_index` per event, so it needs no warm-up. Condition-only triggers have no
-`data[]` to index and live only in memory, so they are derived from the stored definitions — at startup
+`data[]` to index. They live only in memory. So they are derived from the stored definitions, at startup
 and then on a timer.
 
 ```mermaid
@@ -172,8 +176,8 @@ sequenceDiagram
     end
 ```
 
-Because Matcher never writes these rows, it has no local mutation to invalidate on — so the same
-reconciliation runs on a timer (`cce.protocol.refresh-interval-ms`, default 60s), converging all three
+Matcher never writes these rows. It has no local mutation to invalidate on. So the same
+reconciliation runs on a timer (`cce.protocol.refresh-interval-ms`, default 60s). It converges all three
 cases within one interval:
 
 | Change by the management service | Tier 1 (`trigger_index`) | Condition-only + parsed caches |
@@ -182,27 +186,33 @@ cases within one interval:
 | Protocol retired / deleted | Immediate (rows gone) | Dropped on next refresh |
 | Definition modified in place | Immediate | Re-derived on next refresh, detected via `updated_at` |
 
-A refresh that finds nothing changed reads only `(id, updated_at)` — a definition's JSONB is fetched and
-re-parsed only when its stamp moves or its id is new. Each instance polls independently; the caches are
+A refresh that finds nothing changed reads only `(id, updated_at)`. A definition's JSONB is fetched and
+re-parsed only when its stamp moves or its id is new. Each instance polls independently. The caches are
 per-process, so no leasing is needed.
 
-> **Note:** in-place modification is detected through `updated_at`, so a writer that edits `definition`
+> **Note:** in-place modification is detected through `updated_at`. So a writer that edits `definition`
 > without advancing that column will not be picked up. Publishing and retiring are detected regardless,
 > since those change which ids are `ACTIVE`.
 >
 > **Possible refinement:** a `protocol.published` Kafka event would cut the window from one interval to
-> near-zero. It would supplement this sweep rather than replace it — an event that is missed while a
-> consumer is down would otherwise leave the cache stale indefinitely, so the periodic reconciliation
-> stays as the backstop.
+> near-zero. It would supplement this sweep rather than replace it. Without the sweep, an event that is
+> missed while a consumer is down would leave the cache stale indefinitely. So the periodic
+> reconciliation stays as the backstop.
 
 ## 3. Time-Driven SLA Transitions (owned elsewhere)
 
-Matcher schedules these but does not apply them. Creating a step writes one
-`step_sla_state_transition` row per deadline, and completing one on time adds a
-`MET_CONDITION_REACHED` row whose `process_by` is that `completed_at`. The CCE Step SLA Service claims
-each row once its `next_attempt_at` has passed — one gate, nothing fetched early — applies the
-`sla_status` change, and records the `OVERDUE` / `MISSED` deviation where there was a breach. There is no Kafka hop —
-the two services meet on the table, with one writer per column. See
+Matcher schedules these but does not apply them:
+
+- Creating a step writes one `step_sla_state_transition` row per deadline.
+- Completing one on time adds a `MET_CONDITION_REACHED` row whose `process_by` is that `completed_at`.
+
+The CCE Step SLA Service does three things with each row:
+
+1. It claims the row once its `next_attempt_at` has passed. This is one gate, and nothing is fetched early.
+2. It applies the `sla_status` change.
+3. It records the `OVERDUE` / `MISSED` deviation where there was a breach.
+
+There is no Kafka hop. The two services meet on the table, with one writer per column. See
 [Architecture Overview §1.1](architecture-overview.md#11-sla-transition-evaluation-contract).
 
 ```mermaid
@@ -213,7 +223,7 @@ sequenceDiagram
 
     Matcher->>DB: createStep + INSERT step_sla_state_transition (same tx)
     Note over Matcher,DB: One row per deadline present — a step with no<br/>tolerance-days gets no MISSED row, an optional step gets none at all
-    Matcher->>DB: completeStep + INSERT MET_CONDITION_REACHED (same tx)
+    Matcher->>DB: completeStepInstance + INSERT MET_CONDITION_REACHED (same tx)
     Note over Matcher,DB: Only when completed_at beat the step's due_date;<br/>process_by = completed_at, so the row is due at once
 
     loop Polling interval
@@ -255,7 +265,7 @@ flowchart TD
     K --> L["Calculate repeatIndex"]
     L --> N["Create StepInstance — step_status = NOT_STARTED,<br/>sla_status = NULL (nothing judged yet)<br/>+ schedule its SLA transition rows (see §3)"]
 
-    J --> P["completeStep()"]
+    J --> P["completeStepInstance()"]
     N --> P
 
     P --> SS["step_status = COMPLETED<br/>(the event arrived — always set)"]
@@ -270,28 +280,35 @@ flowchart TD
     X --> Y["Step SLA Service applies the rows<br/>and writes sla_status"]
 ```
 
-**`sla_status` is not written here.** This service records that the work happened and when, and
-schedules the verdict; the Step SLA Service reaches it. `step_status` answers *did the work happen?* and
-is always `COMPLETED` here. `sla_status` answers *was it on time?* and arrives a cycle later — so a row
-can legitimately read `COMPLETED` + `MISSED`, meaning the work was done but only after the step had been
-written off.
+**`sla_status` is not written here.** This service records that the work happened and when. It also
+schedules the verdict. The Step SLA Service reaches it.
+
+- `step_status` answers *did the work happen?* It is always `COMPLETED` here.
+- `sla_status` answers *was it on time?* It arrives a cycle later.
+
+So a row can legitimately read `COMPLETED` + `MISSED`. This means the work was done, but only after the
+step had been written off.
 
 > There is no `EARLY` or `ON_TIME` status. The 1.x schema had a separate `completion_status` column with
-> `EARLY`/`ON_TIME`/`LATE`; `V2` drops it, because the pair above already expresses it —
-> `COMPLETED`+`MET` is on time, `COMPLETED`+`OVERDUE`/`MISSED` is late. See
+> `EARLY`/`ON_TIME`/`LATE`. `V2` drops it, because the pair above already expresses it:
+>
+> - `COMPLETED`+`MET` is on time.
+> - `COMPLETED`+`OVERDUE`/`MISSED` is late.
+>
+> See
 > [`SlaStatus`](https://github.com/openphc/cce-common-util/blob/release-2.0.0/docs/data-dictionary.md#slastatus) for the full value reference.
 
 ## 5. Deviation Detection & Recording
 
-Matcher records exactly one deviation type: `ORDER_VIOLATION`, detected on completion. The time-driven
-`OVERDUE` and `MISSED` deviations are recorded by the CCE Step SLA Service (§3), which also owns
-intelligence evaluation for them.
+Matcher records exactly one deviation type, `ORDER_VIOLATION`. It is detected on completion. The
+time-driven `OVERDUE` and `MISSED` deviations are recorded by the CCE Step SLA Service (§3). That service
+also owns intelligence evaluation for them.
 
 > **Intelligence action evaluation** is triggered after the deviation is recorded. See §6 for the full intelligence pipeline flow.
 
 ```mermaid
 flowchart TD
-    T2["completeStep(): a must-predecessor is still outstanding<br/>(detectOrderViolations)"]
+    T2["After completeStepInstance(): a must-predecessor is still outstanding<br/>(OrderViolationDetector, run by MatcherEngine)"]
     T2 -->|"type=ORDER_VIOLATION<br/>+ incompletePrerequisites metadata"| RD
 
     RD["DeviationRecorder.recordDeviation()"]
@@ -369,7 +386,7 @@ sequenceDiagram
 
 ### Intelligence Event Content Assembly
 
-`IntelligenceTriggerEvent` is a flat domain message — every field below is a real field on it. The
+`IntelligenceTriggerEvent` is a flat domain message. Every field below is a real field on it. The
 richer per-execution context (deviation id, evaluation expression, evaluated context) is written to
 `intelligence_event_log`, not onto the event.
 
@@ -415,8 +432,8 @@ flowchart TD
     LOG --> E_IEID
 ```
 
-> `intelligenceEventId` is the `intelligence_event_log` row id, filled in after the row is inserted and
-> used for cross-service correlation. It is also the Kafka message key.
+> `intelligenceEventId` is the `intelligence_event_log` row id. It is filled in after the row is inserted.
+> It is used for cross-service correlation. It is also the Kafka message key.
 
 ## 7. Kafka Consumer Error Handling
 
@@ -442,32 +459,39 @@ flowchart TD
 
 ## 8. Flat Sub-Step Processing
 
-All steps (including those originally nested in `action.action[]`) are treated as peers. Nested step-type actions are flattened at parse time with `relatedSteps` linking them to their parent. No separate sub-step routing is needed — the standard matching and completion flow handles them uniformly.
+All steps (including those originally nested in `action.action[]`) are treated as peers. Nested step-type actions are flattened at parse time with `relatedSteps` linking them to their parent. No separate sub-step routing is needed. The standard matching and completion flow handles them uniformly.
 
 ```mermaid
 flowchart TD
     MATCH["Tier 1/2 match returns actionId"] --> NORMAL["Standard step processing<br/>(Section 1, Step 6)"]
-    NORMAL --> COMPLETE["completeStep(step)"]
-    COMPLETE --> DEPS["createDependentSteps()<br/>(find steps declaring this step id as their prerequisite)"]
+    NORMAL --> COMPLETE["completeStepInstance(stepInstance)"]
+    COMPLETE --> DEPS["ProgressiveInstantiationService.instantiateDependents()<br/>(find steps declaring this step id as their prerequisite)"]
     DEPS --> CREATED["Create dependent steps (NOT_STARTED, sla NULL)"]
-    CREATED --> BACKFILL["backfillMissingMandatorySteps()<br/>(see 'Unrecorded Mandatory Predecessor Backfill' below)"]
+    CREATED --> BACKFILL["MandatoryStepBackfillService.backfillMissingMandatorySteps()<br/>(see 'Unrecorded Mandatory Predecessor Backfill' below)"]
 ```
 
 ### Dependent Step Creation on Completion
 
-`relatedAction` is a **relative** pointer — a step states how it sits against another, from either end (`after-*` or `before-*`) — so the forward direction needed here comes from the normalized graph built by `PlanDefinitionParser.buildDependencyGraph()`. When any step completes, `createDependentSteps()` looks up the steps that depend on it and creates them with due dates taken from the offset on the edge between them.
+A `relatedAction` is written on the later step, and names the step it follows, with `after-end`, the only supported relationship. So the steps that follow a completed step come from the graph built by `PlanDefinitionParser.buildDependencyGraph()`.
+
+When any step completes, progressive instantiation (`ProgressiveInstantiationService.instantiateDependents()`) does two things:
+
+1. It looks up the steps that depend on the completed step and creates them. Their due dates are taken from the offset on the edge between them.
+2. It then opens the mandatory groups that follow the completed step. For now there are none: every group is optional, and an optional group isn't opened by a step it follows (plan point 11).
 
 ```mermaid
 flowchart TD
-    START["createDependentSteps(completedStep, graph)"] --> FIND["graph.successorsOf(completedStep):<br/>steps ordered after it by either an after-* edge<br/>of their own or a before-* edge on the completed step"]
+    START["instantiateDependents(enrollment, completedStepInstance)"] --> FIND["graph.successorsOf(completed step):<br/>the steps whose relatedAction<br/>names the completed step"]
     FIND --> LOOP{"For each dependent step"}
-    LOOP --> DEDUP{"An instance for this step<br/>already exists?"}
-    DEDUP -->|"Yes"| SKIP["Skip — avoid duplicate<br/>(already created reactively via its own<br/>trigger, or by a redelivered predecessor)"]
-    DEDUP -->|"No"| MUST{"dependent step's<br/>requiredBehavior == must?"}
+    LOOP --> MUST{"dependent step's<br/>requiredBehavior == must?"}
     MUST -->|"No (could / unspecified)"| SKIP2["Skip pre-creation — a dangling row could later go<br/>MISSED even though its event never arrives;<br/>created on the fly if its own trigger fires"]
     MUST -->|"Yes"| FANIN{"Any OTHER prerequisite still outstanding<br/>(NOT_STARTED + sla NULL/OVERDUE)?"}
     FANIN -->|"Yes"| SKIP3["Defer — that prerequisite's own completion<br/>re-runs this, so the due date anchors to<br/>the LAST prerequisite to finish"]
-    FANIN -->|"No"| CALC["Calculate due date from the dependent step's own<br/>offset + relationship<br/>(after-end → completedAt [clinical time], after-start → dueDate)"]
+    FANIN -->|"No"| GROUP{"In a group: a group instance it can join?<br/>(StepGroupService.groupInstanceForWork)"}
+    GROUP -->|"No — a calendar-day group<br/>with no cycle yet"| SKIP4["Skip — only an event of its own<br/>opens a calendar-day cycle"]
+    GROUP -->|"Yes, or outside any group"| DEDUP{"A step instance for this step already<br/>exists where it would go?"}
+    DEDUP -->|"Yes"| SKIP["Skip — avoid duplicate<br/>(created reactively via its own trigger,<br/>by a redelivered predecessor, or by its group opening)"]
+    DEDUP -->|"No"| CALC["Calculate due date from the dependent step's own<br/>offset + relationship<br/>(after-end → completedAt [clinical time];<br/>after-start, only in protocols stored earlier → dueDate)"]
     CALC --> RECURRING{"TimingInfo.count > 1?"}
 
     RECURRING -->|"Yes"| MULTI["Create N recurring instances with staggered due dates"]
@@ -478,17 +502,24 @@ flowchart TD
     SKIP --> NEXT
     SKIP2 --> NEXT
     SKIP3 --> NEXT
+    SKIP4 --> NEXT
     NEXT --> LOOP
-    LOOP -->|"Done"| END["Return"]
+    LOOP -->|"Done"| GROUPS["Open the mandatory groups that follow it<br/>(StepGroupService.openFollowingGroup)<br/>none for now: every group is optional"]
+    GROUPS --> END["Return"]
 ```
 
-### Unrecorded Mandatory Predecessor Backfill (backfillMissingMandatorySteps)
+### Unrecorded Mandatory Predecessor Backfill (MandatoryStepBackfillService)
 
-Progressive instantiation only works *forward*, so a step created reactively from its own trigger leaves the mandatory steps that should have preceded it with no `step_instance` row — invisible both in the journey view ("not started") and to the SLA evaluator, having no scheduled transition. After every completion, mandatory predecessors of the observed progress that have no row are materialized as `NOT_STARTED` with no SLA judgement. See `architecture-overview.md` §6.1 for the full rationale.
+Progressive instantiation only works *forward*. So a step created reactively from its own trigger leaves the mandatory steps that should have preceded it with no `step_instance` row. Those steps are invisible in two places:
+
+- in the journey view ("not started")
+- to the SLA evaluator, because they have no scheduled transition
+
+After every completion, mandatory predecessors of the observed progress that have no row are materialized as `NOT_STARTED` with no SLA judgement. See `architecture-overview.md` §6.1 for the full rationale.
 
 ```mermaid
 flowchart TD
-    START["backfillMissingMandatorySteps(completedStep, allSteps)"] --> OBSERVED["Collect observed step ids<br/>(all step_instance rows of this protocol instance)"]
+    START["backfillMissingMandatorySteps(enrollment, completedStepInstance)"] --> OBSERVED["Collect observed step ids<br/>(all step_instance rows of this protocol instance)"]
     OBSERVED --> PRED["computeMustPredecessorSteps():<br/>transitive relatedAction ancestors of every observed step,<br/>restricted to requiredBehavior == must"]
     PRED --> MISSING{"Any with no<br/>step_instance row?"}
     MISSING -->|"No"| DONE["Return — nothing to backfill"]
@@ -499,6 +530,6 @@ flowchart TD
     LOOP -->|"Done"| DONE2["Their transition rows now exist, so Step SLA drives<br/>sla NULL → OVERDUE → MISSED (deviation), judging any<br/>late completion against the completed_at Matcher recorded"]
 ```
 
-> Steps still **ahead** in the chain are deliberately excluded — backfilling them would stamp them with this completion's time and flatten the schedule their own `relatedAction` offsets define. They are left to progressive instantiation.
+> Steps still **ahead** in the chain are deliberately excluded. Backfilling them would stamp them with this completion's time. That would flatten the schedule their own `relatedAction` offsets define. They are left to progressive instantiation.
 
-> **Protocol completion:** there is currently no code path that transitions a `ProtocolInstance` out of `ACTIVE`. The automatic completion check and its supporting graph helpers were removed pending finalized completion criteria — see [Architecture Overview §6.2](architecture-overview.md#62-protocol-instance).
+> **Protocol completion:** there is currently no code path that transitions a `ProtocolInstance` out of `ACTIVE`. The automatic completion check and its supporting graph helpers were removed pending finalized completion criteria. See [Architecture Overview §6.2](architecture-overview.md#62-protocol-instance).
